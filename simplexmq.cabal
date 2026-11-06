@@ -663,3 +663,12 @@ test-suite simplexmq-test
   if flag(client_postgres) || flag(server_postgres)
     build-depends:
         postgresql-simple ==0.7.*
+
+-- Small standalone transport suite, usable without SMP/XFTP integration fixtures.
+test-suite xrcp-lifecycle
+  type: exitcode-stdio-1.0
+  main-is: RemoteControlLifecycle.hs
+  hs-source-dirs: tests
+  default-language: Haskell2010
+  ghc-options: -threaded -Wall
+  build-depends: base, simplexmq, aeson, hspec, network, unliftio, mtl, simple-logger

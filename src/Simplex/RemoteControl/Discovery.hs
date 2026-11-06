@@ -13,6 +13,7 @@ module Simplex.RemoteControl.Discovery
     mkLastLocalHost,
     preferAddress,
     startTLSServer,
+    startTLSServerOn,
     withSender,
     withListener,
     recvAnnounce,
@@ -78,13 +79,18 @@ preferAddress RCCtrlAddress {address, interface} addrs =
     matchIface RCCtrlAddress {interface = i} = i == interface
 
 startTLSServer :: Maybe Word16 -> TMVar (Maybe N.PortNumber) -> TLS.Credential -> TLS.ServerHooks -> (Transport.TLS 'TServer -> IO ()) -> IO (Async ())
-startTLSServer port_ startedOnPort credentials hooks server = async . liftIO $ do
+startTLSServer = startTLSServerOn Nothing
+
+-- | Bind a retained listener to the selected address; Nothing preserves LAN discovery.
+startTLSServerOn :: Maybe N.HostName -> Maybe Word16 -> TMVar (Maybe N.PortNumber) -> TLS.Credential -> TLS.ServerHooks -> (Transport.TLS 'TServer -> IO ()) -> IO (Async ())
+startTLSServerOn bindHost port_ startedOnPort credentials hooks server = async . liftIO $ do
   started <- newEmptyTMVarIO
-  bracketOnError (startTCPServer started Nothing $ maybe "0" show port_) (\_e -> setPort Nothing) $ \socket ->
+  (bracket (startTCPServer started bindHost $ maybe "0" show port_) N.close $ \socket ->
     ifM
       (atomically $ readTMVar started)
       (runServer started socket)
-      (setPort Nothing)
+      (setPort Nothing))
+    `onException` setPort Nothing
   where
     runServer started socket = do
       port <- N.socketPort socket
