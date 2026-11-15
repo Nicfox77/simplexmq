@@ -85,11 +85,12 @@ startTLSServer = startTLSServerOn Nothing
 startTLSServerOn :: Maybe N.HostName -> Maybe Word16 -> TMVar (Maybe N.PortNumber) -> TLS.Credential -> TLS.ServerHooks -> (Transport.TLS 'TServer -> IO ()) -> IO (Async ())
 startTLSServerOn bindHost port_ startedOnPort credentials hooks server = async . liftIO $ do
   started <- newEmptyTMVarIO
-  (bracket (startTCPServer started bindHost $ maybe "0" show port_) N.close $ \socket ->
-    ifM
-      (atomically $ readTMVar started)
-      (runServer started socket)
-      (setPort Nothing))
+  ( bracket (startTCPServer started bindHost $ maybe "0" show port_) N.close $ \socket ->
+      ifM
+        (atomically $ readTMVar started)
+        (runServer started socket)
+        (setPort Nothing)
+    )
     `onException` setPort Nothing
   where
     runServer started socket = do

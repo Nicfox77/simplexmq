@@ -3,20 +3,20 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-import Control.Monad (forM_, void)
 import Control.Logger.Simple
+import Control.Monad (forM_, void)
 import Control.Monad.Except (runExceptT)
 import qualified Data.Aeson as J
-import qualified Network.Socket as N
 import Data.String (fromString)
+import qualified Network.Socket as N
 import qualified Simplex.Messaging.Crypto as C
-import Simplex.Messaging.Transport (TLS (..), cPut, cGet)
 import Simplex.Messaging.Encoding.String (strDecode, strEncode)
-import System.Environment (lookupEnv)
+import Simplex.Messaging.Transport (TLS (..), cGet, cPut)
 import Simplex.Messaging.Transport.Client (TransportHost (..))
 import Simplex.RemoteControl.Client
 import Simplex.RemoteControl.Invitation
 import Simplex.RemoteControl.Types
+import System.Environment (lookupEnv)
 import Test.Hspec
 import UnliftIO
 
@@ -27,7 +27,7 @@ main = withGlobalLogging (LogConfig Nothing True) $ hspec $ do
       drg <- C.newRandom
       pairing <- newRCHostPairing drg
       endpoint <- lookupEnv "XRCP_TEST_ADDRESS"
-      let addr = maybe (RCCtrlAddress (THIPv4 (127,0,0,1)) "lo") (\ip -> RCCtrlAddress (either error id $ strDecode $ fromString ip) "tailscale0") endpoint
+      let addr = maybe (RCCtrlAddress (THIPv4 (127, 0, 0, 1)) "lo") (\ip -> RCCtrlAddress (either error id $ strDecode $ fromString ip) "tailscale0") endpoint
       (_, signed, host, incoming) <- right =<< runExceptT (connectRCHostPersistent drg pairing J.Null False (Just addr) Nothing)
       inv <- maybe (fail "signature") pure $ verifySignedInvitation signed
       let connect cp = do
@@ -67,7 +67,7 @@ main = withGlobalLogging (LogConfig Nothing True) $ hspec $ do
         timeout 1000000 (releaseHostSession host pendingSid) `shouldReturn` Just ()
         cancelCtrlClient pending
         cancelCtrlClient pending
-        forM_ [1..8 :: Int] $ \_ -> do
+        forM_ [1 .. 8 :: Int] $ \_ -> do
           (client, _, _, _, sid, _) <- connect (Just cp2)
           releaseHostSession host sid
           releaseHostSession host sid
@@ -75,7 +75,7 @@ main = withGlobalLogging (LogConfig Nothing True) $ hspec $ do
     it "fetches fresh invitations after listener restart with mutual identity checks" $ do
       drg <- C.newRandom
       pairing <- newRCHostPairing drg
-      let addr = RCCtrlAddress (THIPv4 (127,0,0,1)) "lo"
+      let addr = RCCtrlAddress (THIPv4 (127, 0, 0, 1)) "lo"
       (_, signed1@RCSignedInvitation {invitation = oldInv@RCInvitation {port}}, listener1, steps1) <- right =<< runExceptT (connectRCHostPersistent drg pairing J.Null False (Just addr) Nothing)
       inv1 <- maybe (fail "signature") pure $ verifySignedInvitation signed1
       (phone1, phoneSteps1) <- right =<< runExceptT (connectRCCtrl drg inv1 Nothing J.Null)
@@ -92,7 +92,7 @@ main = withGlobalLogging (LogConfig Nothing True) $ hspec $ do
         dh oldInv `shouldNotBe` dh freshInv
         skey oldInv `shouldNotBe` skey freshInv
         let RCCtrlPairing {idPubKey = desktopId} = cp1
-            fetch cp = runExceptT (requestRCCtrlInvitation drg cp (THIPv4 (127,0,0,1)) port) `catchAny` (pure . Left . RCEException . show)
+            fetch cp = runExceptT (requestRCCtrlInvitation drg cp (THIPv4 (127, 0, 0, 1)) port) `catchAny` (pure . Left . RCEException . show)
         -- A correct TLS pin with the wrong long-term signing identity fails.
         (wrongIdentity, _) <- atomically $ C.generateKeyPair drg
         fetch cp1 {idPubKey = wrongIdentity} >>= (\r -> either (== RCEIdentity) (const False) r `shouldBe` True)
@@ -138,23 +138,23 @@ main = withGlobalLogging (LogConfig Nothing True) $ hspec $ do
     it "closes the listening port when its owner stops" $ do
       drg <- C.newRandom
       pairing <- newRCHostPairing drg
-      (_, RCSignedInvitation {invitation = RCInvitation {port}}, host, _) <- right =<< runExceptT (connectRCHostPersistent drg pairing J.Null False (Just $ RCCtrlAddress (THIPv4 (127,0,0,1)) "lo") Nothing)
+      (_, RCSignedInvitation {invitation = RCInvitation {port}}, host, _) <- right =<< runExceptT (connectRCHostPersistent drg pairing J.Null False (Just $ RCCtrlAddress (THIPv4 (127, 0, 0, 1)) "lo") Nothing)
       cancelHostClient host
       bracket (N.socket N.AF_INET N.Stream N.defaultProtocol) N.close $ \sock ->
-        tryIO (N.connect sock $ N.SockAddrInet (fromIntegral port) $ N.tupleToHostAddress (127,0,0,1)) >>= (`shouldSatisfy` either (const True) (const False))
+        tryIO (N.connect sock $ N.SockAddrInet (fromIntegral port) $ N.tupleToHostAddress (127, 0, 0, 1)) >>= (`shouldSatisfy` either (const True) (const False))
     it "reports an occupied port without leaking a waiting startup" $ do
       drg <- C.newRandom
       pairing <- newRCHostPairing drg
       bracket (N.socket N.AF_INET N.Stream N.defaultProtocol) N.close $ \sock -> do
-        N.bind sock $ N.SockAddrInet 0 $ N.tupleToHostAddress (127,0,0,1)
+        N.bind sock $ N.SockAddrInet 0 $ N.tupleToHostAddress (127, 0, 0, 1)
         N.listen sock 1
         port <- N.socketPort sock
-        result <- timeout 2000000 $ runExceptT $ connectRCHostPersistent drg pairing J.Null False (Just $ RCCtrlAddress (THIPv4 (127,0,0,1)) "lo") (Just $ fromIntegral port)
+        result <- timeout 2000000 $ runExceptT $ connectRCHostPersistent drg pairing J.Null False (Just $ RCCtrlAddress (THIPv4 (127, 0, 0, 1)) "lo") (Just $ fromIntegral port)
         (case result of Just (Left RCETLSStartFailed) -> True; _ -> False) `shouldBe` True
     it "fails closed when the selected interface is absent" $ do
       drg <- C.newRandom
       pairing <- newRCHostPairing drg
-      result <- runExceptT $ connectRCHostPersistent drg pairing J.Null False (Just $ RCCtrlAddress (THIPv4 (100,100,100,100)) "absent-tailscale") Nothing
+      result <- runExceptT $ connectRCHostPersistent drg pairing J.Null False (Just $ RCCtrlAddress (THIPv4 (100, 100, 100, 100)) "absent-tailscale") Nothing
       either (== RCENoLocalAddress) (const False) result `shouldBe` True
   where
     rejected (Just (Left _)) = True

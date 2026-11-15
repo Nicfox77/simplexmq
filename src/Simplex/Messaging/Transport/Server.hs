@@ -132,12 +132,18 @@ runTransportServerSocket started getSocket threadLabel srvParams cfg server = do
       -- validation/pinning hook. XRCP needs this for its HELLO identity check.
       peerCert <- newTVarIO $ X.CertificateChain []
       let hooks = T.serverHooks srvParams
-          params = srvParams {T.serverHooks = hooks {T.onClientCertificate = \cc -> do
-            usage <- T.onClientCertificate hooks cc
-            case usage of
-              T.CertificateUsageAccept -> atomically $ writeTVar peerCert cc
-              _ -> pure ()
-            pure usage}}
+          params =
+            srvParams
+              { T.serverHooks =
+                  hooks
+                    { T.onClientCertificate = \cc -> do
+                        usage <- T.onClientCertificate hooks cc
+                        case usage of
+                          T.CertificateUsageAccept -> atomically $ writeTVar peerCert cc
+                          _ -> pure ()
+                        pure usage
+                    }
+              }
       tls <- connectTLS Nothing tCfg params conn
       chain <- readTVarIO peerCert
       (False,) <$> getTransportConnection tCfg True chain tls

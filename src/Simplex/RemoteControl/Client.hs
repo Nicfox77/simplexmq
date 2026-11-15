@@ -66,7 +66,7 @@ import Simplex.Messaging.Crypto.SNTRUP761
 import Simplex.Messaging.Crypto.SNTRUP761.Bindings
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String (StrEncoding (..))
-import Simplex.Messaging.Transport (TSbChainKeys (..), TLS (..), TransportPeer (..), cGet, cPut)
+import Simplex.Messaging.Transport (TLS (..), TSbChainKeys (..), TransportPeer (..), cGet, cPut)
 import Simplex.Messaging.Transport.Buffer (peekBuffered)
 import Simplex.Messaging.Transport.Client (TransportClientConfig (..), TransportHost (..), defaultTransportClientConfig, runTransportClient)
 import Simplex.Messaging.Transport.Credentials (genCredentials, tlsCredentials)
@@ -174,10 +174,11 @@ connectRCHost_ persistent drg pairing@RCHostPairing {caKey, caCert, idPrivKey, k
           let sid = tlsUniq tls
           acquired <- atomically $ tryPutTMVar activeSession (sid, end, finished, tid)
           when acquired $
-            (void . runExceptT $ do
-              r' <- newEmptyTMVarIO
-              whenM (atomically $ tryPutTMVar r $ Right (sid, tls, r')) $
-                runSession tls end r' `putRCError` r')
+            ( void . runExceptT $ do
+                r' <- newEmptyTMVarIO
+                whenM (atomically $ tryPutTMVar r $ Right (sid, tls, r')) $
+                  runSession tls end r' `putRCError` r'
+            )
               `finally` do
                 -- Close before releasing admission; old handlers cannot accumulate.
                 TLS.contextClose (tlsContext tls) `catchAny` (logError . tshow)
@@ -209,9 +210,10 @@ connectRCHost_ persistent drg pairing@RCHostPairing {caKey, caCert, idPrivKey, k
                 kh <- readTVarIO knownHostVar
                 let accept = maybe True (\h -> hostFingerprint h == certFingerprint ca) kh
                 if accept
-                  then validateClientCertificate cc >>= \case
-                    Nothing -> pure TLS.CertificateUsageAccept
-                    Just reason -> pure $ TLS.CertificateUsageReject reason
+                  then
+                    validateClientCertificate cc >>= \case
+                      Nothing -> pure TLS.CertificateUsageAccept
+                      Just reason -> pure $ TLS.CertificateUsageReject reason
                   else pure $ TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
               _ -> pure $ TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
         }
@@ -252,9 +254,11 @@ certFingerprint caCert = C.KeyHash fp
 -- A delayed disconnect callback can never release a replacement session.
 releaseHostSession :: RCHostClient -> SessionCode -> IO ()
 releaseHostSession RCHostClient {client_ = RCHClient_ {activeSession}} sid = do
-  done <- atomically $ tryReadTMVar activeSession >>= \case
-    Just (current, end, finished, tid) | current == sid -> Just (finished, tid) <$ void (tryPutTMVar end ())
-    _ -> pure Nothing
+  done <-
+    atomically $
+      tryReadTMVar activeSession >>= \case
+        Just (current, end, finished, tid) | current == sid -> Just (finished, tid) <$ void (tryPutTMVar end ())
+        _ -> pure Nothing
   forM_ done $ \(finished, tid) -> killThread tid >> atomically (readTMVar finished)
 
 cancelHostClient :: RCHostClient -> IO ()
