@@ -12,10 +12,13 @@ module Simplex.RemoteControl.Client
     RCHostConnection,
     newRCHostPairing,
     connectRCHost,
+    connectRCHostPersistent,
+    releaseHostSession,
     cancelHostClient,
     RCCtrlClient (action),
     RCCtrlConnection,
     connectRCCtrl,
+    requestRCCtrlInvitation,
     discoverRCCtrl,
     confirmCtrlSession,
     cancelCtrlClient,
@@ -40,9 +43,9 @@ import qualified Data.Aeson as J
 import Data.Bitraversable (bimapM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as LB
 import Data.Default (def)
-import Data.Functor (($>))
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as L
 import Data.Maybe (isNothing)
@@ -70,7 +73,7 @@ import Simplex.Messaging.Transport.Credentials (genCredentials, tlsCredentials)
 import Simplex.Messaging.Transport.Server (validateClientCertificate)
 import Simplex.Messaging.Util
 import Simplex.Messaging.Version
-import Simplex.RemoteControl.Discovery (getLocalAddress, recvAnnounce, startTLSServer, withListener, withSender)
+import Simplex.RemoteControl.Discovery (getLocalAddress, recvAnnounce, startTLSServerOn, withListener, withSender)
 import Simplex.RemoteControl.Invitation
 import Simplex.RemoteControl.Types
 import UnliftIO
@@ -99,22 +102,37 @@ data RCHostClient = RCHostClient
 data RCHClient_ = RCHClient_
   { startedPort :: TMVar (Maybe PortNumber),
     announcer :: TMVar (Async (Either RCErrorType ())),
-    hostCAHash :: TMVar C.KeyHash,
-    endSession :: TMVar ()
+    knownHostVar :: TVar (Maybe KnownHostPairing),
+    activeSession :: TMVar (SessionCode, TMVar (), TMVar (), ThreadId)
   }
 
 type RCHostConnection = (NonEmpty RCCtrlAddress, RCSignedInvitation, RCHostClient, RCStepTMVar (SessionCode, TLS 'TServer, RCStepTMVar (RCHostSession, RCHostHello, RCHostPairing)))
 
 connectRCHost :: TVar ChaChaDRG -> RCHostPairing -> J.Value -> Bool -> Maybe RCCtrlAddress -> Maybe Word16 -> ExceptT RCErrorType IO RCHostConnection
-connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ctrlAppInfo multicast rcAddrPrefs_ port_ = do
+connectRCHost = connectRCHost_ False
+
+-- | An owned listener that can accept a new transport after releaseHostSession.
+-- Session keys remain memory-only and are never restored after listener restart.
+connectRCHostPersistent :: TVar ChaChaDRG -> RCHostPairing -> J.Value -> Bool -> Maybe RCCtrlAddress -> Maybe Word16 -> ExceptT RCErrorType IO RCHostConnection
+connectRCHostPersistent = connectRCHost_ True
+
+connectRCHost_ :: Bool -> TVar ChaChaDRG -> RCHostPairing -> J.Value -> Bool -> Maybe RCCtrlAddress -> Maybe Word16 -> ExceptT RCErrorType IO RCHostConnection
+connectRCHost_ persistent drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ctrlAppInfo multicast rcAddrPrefs_ port_ = do
+  when (multicast && isNothing knownHost) $ throwE RCENewController
   r <- newEmptyTMVarIO
-  found@(RCCtrlAddress {address} :| _) <- findCtrlAddress
+  found@(RCCtrlAddress {address, interface = chosenIface} :| _) <- findCtrlAddress
+  -- A missing explicitly selected interface must not expose a retained listener
+  -- on a different network. The normal LAN API retains its previous behavior.
+  when persistent $ forM_ rcAddrPrefs_ $ \RCCtrlAddress {address = wanted, interface = iface} ->
+    unless (address == wanted || chosenIface == iface) $ throwE RCENoLocalAddress
   c@RCHClient_ {startedPort, announcer} <- liftIO mkClient
+  invitationVar <- newEmptyTMVarIO
   hostKeys <- atomically genHostKeys
-  action <- liftIO $ runClient c r hostKeys
+  action <- liftIO $ runClient (if persistent && not (isNothing rcAddrPrefs_) then Just $ BC.unpack $ strEncode address else Nothing) c r invitationVar hostKeys
   -- wait for the port to make invitation
   portNum <- atomically $ readTMVar startedPort
   signedInv@RCSignedInvitation {invitation} <- maybe (throwE RCETLSStartFailed) (liftIO . mkInvitation hostKeys address) portNum
+  atomically $ putTMVar invitationVar signedInv
   when multicast $ case knownHost of
     Nothing -> throwE RCENewController
     Just KnownHostPairing {hostDhPubKey} -> do
@@ -130,48 +148,72 @@ connectRCHost drg pairing@RCHostPairing {caKey, caCert, idPrivKey, knownHost} ct
     mkClient = do
       startedPort <- newEmptyTMVarIO
       announcer <- newEmptyTMVarIO
-      endSession <- newEmptyTMVarIO
-      hostCAHash <- newEmptyTMVarIO
-      pure RCHClient_ {startedPort, announcer, hostCAHash, endSession}
-    runClient :: RCHClient_ -> RCStepTMVar (SessionCode, TLS 'TServer, RCStepTMVar (RCHostSession, RCHostHello, RCHostPairing)) -> RCHostKeys -> IO (Async ())
-    runClient RCHClient_ {startedPort, announcer, hostCAHash, endSession} r hostKeys = do
+      knownHostVar <- newTVarIO knownHost
+      activeSession <- newEmptyTMVarIO
+      pure RCHClient_ {startedPort, announcer, knownHostVar, activeSession}
+    runClient :: Maybe String -> RCHClient_ -> RCStepTMVar (SessionCode, TLS 'TServer, RCStepTMVar (RCHostSession, RCHostHello, RCHostPairing)) -> TMVar RCSignedInvitation -> RCHostKeys -> IO (Async ())
+    runClient bindHost RCHClient_ {startedPort, announcer, knownHostVar, activeSession} r invitationVar hostKeys = do
       tlsCreds <- genTLSCredentials drg caKey caCert
-      startTLSServer port_ startedPort tlsCreds (tlsHooks r knownHost hostCAHash) $ \tls ->
-        void . runExceptT $ do
-          r' <- newEmptyTMVarIO
-          whenM (atomically $ tryPutTMVar r $ Right (tlsUniq tls, tls, r')) $
-            runSession tls r' `putRCError` r'
+      startTLSServerOn bindHost port_ startedPort tlsCreds (tlsHooks r knownHostVar activeSession) $ \tls ->
+        if tlsALPN tls == Just invitationALPN
+          then void . timeout 15000000 . runExceptT $ do
+            -- Authentication is connection-local. Recheck the live pin after TLS;
+            -- an overlapping first pairing must not authorize another certificate.
+            kh <- readTVarIO knownHostVar
+            case (kh, tlsPeerCert tls) of
+              (Just h, X.CertificateChain [_leaf, ca]) | hostFingerprint h == certFingerprint ca -> do
+                inv <- atomically $ readTMVar invitationVar
+                sendRCPacket tls (Large $ strEncode inv)
+              _ -> throwE RCEIdentity
+          else acceptSession tls
       where
-        runSession tls r' = do
-          logDebug "Incoming TLS connection"
+        acceptSession tls = do
+          end <- newEmptyTMVarIO
+          finished <- newEmptyTMVarIO
+          tid <- myThreadId
+          let sid = tlsUniq tls
+          acquired <- atomically $ tryPutTMVar activeSession (sid, end, finished, tid)
+          when acquired $
+            (void . runExceptT $ do
+              r' <- newEmptyTMVarIO
+              whenM (atomically $ tryPutTMVar r $ Right (sid, tls, r')) $
+                runSession tls end r' `putRCError` r')
+              `finally` do
+                -- Close before releasing admission; old handlers cannot accumulate.
+                TLS.contextClose (tlsContext tls) `catchAny` (logError . tshow)
+                atomically $ void (tryTakeTMVar activeSession) >> putTMVar finished ()
+        runSession tls end r' = do
+          -- TLS handshakes may overlap. Recheck the latest pin after admission.
+          kh <- readTVarIO knownHostVar
+          hostCA <- case tlsPeerCert tls of
+            X.CertificateChain [_leaf, ca] -> pure $ certFingerprint ca
+            _ -> throwE RCEIdentity
+          forM_ kh $ \h -> unless (hostFingerprint h == hostCA) $ throwE RCEIdentity
           hostEncHello <- receiveRCPacket tls
-          logDebug "Received host HELLO"
-          hostCA <- atomically $ takeTMVar hostCAHash
-          (ctrlEncHello, sessionKeys, helloBody, pairing') <- prepareHostSession drg hostCA pairing hostKeys hostEncHello
+          (ctrlEncHello, sessionKeys, helloBody, pairing') <- prepareHostSession drg hostCA pairing {knownHost = kh} hostKeys hostEncHello
           sendRCPacket tls ctrlEncHello
-          logDebug "Sent ctrl HELLO"
+          -- Pin before publishing success, including the very first QR session.
+          let RCHostPairing {knownHost = kh'} = pairing'
+          atomically $ writeTVar knownHostVar kh'
           whenM (atomically $ tryPutTMVar r' $ Right (RCHostSession {tls, sessionKeys}, helloBody, pairing')) $ do
             atomically (tryReadTMVar announcer) >>= mapM_ uninterruptibleCancel
-            -- can use `RCHostSession` until `endSession` is signalled
-            logDebug "Holding session"
-            atomically $ takeTMVar endSession
-    tlsHooks :: TMVar a -> Maybe KnownHostPairing -> TMVar C.KeyHash -> TLS.ServerHooks
-    tlsHooks r knownHost_ hostCAHash =
+            atomically $ takeTMVar end
+    tlsHooks :: TMVar a -> TVar (Maybe KnownHostPairing) -> TMVar b -> TLS.ServerHooks
+    tlsHooks r knownHostVar activeSession =
       def
-        { TLS.onNewHandshake = \_ -> atomically $ isNothing <$> tryReadTMVar r,
+        { TLS.onALPNClientSuggest = if persistent then Just (\offered -> pure $ if invitationALPN `elem` offered then invitationALPN else "") else Nothing,
+          TLS.onNewHandshake = \_ -> atomically $ (&&) <$> isEmptyTMVar r <*> isEmptyTMVar activeSession,
           TLS.onClientCertificate = \cc@(X.CertificateChain chain) ->
             case chain of
               [_leaf, ca] -> do
-                let kh = certFingerprint ca
-                    accept = maybe True (\h -> hostFingerprint h == kh) knownHost_
+                kh <- readTVarIO knownHostVar
+                let accept = maybe True (\h -> hostFingerprint h == certFingerprint ca) kh
                 if accept
-                  then
-                    validateClientCertificate cc >>= \case
-                      Nothing -> atomically (putTMVar hostCAHash kh) $> TLS.CertificateUsageAccept
-                      Just reason -> pure $ TLS.CertificateUsageReject reason
+                  then validateClientCertificate cc >>= \case
+                    Nothing -> pure TLS.CertificateUsageAccept
+                    Just reason -> pure $ TLS.CertificateUsageReject reason
                   else pure $ TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
-              _ ->
-                pure $ TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
+              _ -> pure $ TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
         }
     genHostKeys :: STM RCHostKeys
     genHostKeys = do
@@ -206,9 +248,17 @@ certFingerprint caCert = C.KeyHash fp
   where
     Fingerprint fp = getFingerprint caCert X.HashSHA256
 
+-- | Release only the matching transport and wait for its handler to finish.
+-- A delayed disconnect callback can never release a replacement session.
+releaseHostSession :: RCHostClient -> SessionCode -> IO ()
+releaseHostSession RCHostClient {client_ = RCHClient_ {activeSession}} sid = do
+  done <- atomically $ tryReadTMVar activeSession >>= \case
+    Just (current, end, finished, tid) | current == sid -> Just (finished, tid) <$ void (tryPutTMVar end ())
+    _ -> pure Nothing
+  forM_ done $ \(finished, tid) -> killThread tid >> atomically (readTMVar finished)
+
 cancelHostClient :: RCHostClient -> IO ()
-cancelHostClient RCHostClient {action, client_ = RCHClient_ {announcer, endSession}} = do
-  atomically $ putTMVar endSession ()
+cancelHostClient RCHostClient {action, client_ = RCHClient_ {announcer}} = do
   atomically (tryTakeTMVar announcer) >>= mapM_ uninterruptibleCancel
   uninterruptibleCancel action
 
@@ -255,6 +305,26 @@ data RCCClient_ = RCCClient_
   }
 
 type RCCtrlConnection = (RCCtrlClient, RCStepTMVar (SessionCode, TLS 'TClient, RCStepTMVar (RCCtrlSession, RCCtrlPairing)))
+
+-- Dedicated TLS ALPN on the existing port: no multicast or extra listener.
+-- The response is protected by a fresh, mutually authenticated TLS channel.
+-- Never accept a response on a connection where ALPN was not negotiated.
+invitationALPN :: ByteString
+invitationALPN = "simplex-xrcp-invitation/1"
+
+requestRCCtrlInvitation :: TVar ChaChaDRG -> RCCtrlPairing -> TransportHost -> Word16 -> ExceptT RCErrorType IO RCVerifiedInvitation
+requestRCCtrlInvitation drg RCCtrlPairing {caKey, caCert, ctrlFingerprint, idPubKey} host port =
+  (`catchAllErrors` throwE) $
+    timeoutThrow RCENotDiscovered 15000000 $ do
+      credentials <- liftIO $ genTLSCredentials drg caKey caCert
+      let cfg = defaultTransportClientConfig {clientCredentials = Just credentials, clientALPN = Just [invitationALPN]}
+      ExceptT . runTransportClient cfg Nothing host (show port) (Just ctrlFingerprint) $ \tls -> runExceptT $ do
+        unless (tlsALPN tls == Just invitationALPN) $ throwE RCEVersion
+        Large encoded <- receiveRCPacket tls
+        signed <- liftEitherWith RCESyntax $ strDecode encoded
+        verified@(RCVerifiedInvitation RCInvitation {ca, idkey}) <- maybe (throwE RCEInvitation) pure $ verifySignedInvitation signed
+        unless (ca == ctrlFingerprint && idkey == idPubKey) $ throwE RCEIdentity
+        pure verified
 
 -- app should determine whether it is a new or known pairing based on CA fingerprint in the invitation
 connectRCCtrl :: TVar ChaChaDRG -> RCVerifiedInvitation -> Maybe RCCtrlPairing -> J.Value -> ExceptT RCErrorType IO RCCtrlConnection
@@ -428,7 +498,7 @@ confirmCtrlSession RCCtrlClient {client_ = RCCClient_ {confirmSession}} res = do
 
 cancelCtrlClient :: RCCtrlClient -> IO ()
 cancelCtrlClient RCCtrlClient {action, client_ = RCCClient_ {endSession}} = do
-  atomically $ putTMVar endSession ()
+  atomically $ void $ tryPutTMVar endSession ()
   uninterruptibleCancel action
 
 -- * Session encryption

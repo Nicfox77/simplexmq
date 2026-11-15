@@ -128,8 +128,19 @@ runTransportServerSocket started getSocket threadLabel srvParams cfg server = do
   where
     tCfg = serverTransportConfig cfg
     setupTLS conn = do
-      tls <- connectTLS Nothing tCfg srvParams conn
-      (False,) <$> getTransportConnection tCfg True (X.CertificateChain []) tls
+      -- Capture the accepted chain per connection while preserving the caller's
+      -- validation/pinning hook. XRCP needs this for its HELLO identity check.
+      peerCert <- newTVarIO $ X.CertificateChain []
+      let hooks = T.serverHooks srvParams
+          params = srvParams {T.serverHooks = hooks {T.onClientCertificate = \cc -> do
+            usage <- T.onClientCertificate hooks cc
+            case usage of
+              T.CertificateUsageAccept -> atomically $ writeTVar peerCert cc
+              _ -> pure ()
+            pure usage}}
+      tls <- connectTLS Nothing tCfg params conn
+      chain <- readTVarIO peerCert
+      (False,) <$> getTransportConnection tCfg True chain tls
 
 runTransportServerSocketState :: Transport c => SocketState -> TMVar Bool -> IO Socket -> String -> T.Supported -> TLSServerCredential -> TransportServerConfig -> (Socket -> (SNICredentialUsed, c 'TServer) -> IO ()) -> IO ()
 runTransportServerSocketState ss started getSocket threadLabel srvSupported srvCreds cfg server =
@@ -242,8 +253,7 @@ startTCPServer started host port = withSocketsDo $ resolve >>= open >>= setStart
     select as = fromJust $ family AF_INET6 <|> family AF_INET
       where
         family f = find ((== f) . addrFamily) as
-    open addr = do
-      sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
+    open addr = E.bracketOnError (socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)) close $ \sock -> do
       setSocketOption sock ReuseAddr 1
       withFdSocket sock setCloseOnExecIfNeeded
       logNote $ "binding to " <> tshow (addrAddress addr)
